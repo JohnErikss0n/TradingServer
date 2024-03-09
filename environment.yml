@@ -1,0 +1,11 @@
+name: project_1_env
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pandas
+  - requests
+  - pip
+  - pip:
+      - influxdb #Highly scalable R/W Time  Series database
+      - finnhub
