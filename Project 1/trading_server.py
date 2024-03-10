@@ -327,6 +327,11 @@ class TradingServer:
             print(f"Deleted all entries for {ticker} and removed from tickers list.")
 
     def apply_calculations_segmented(self,df):
+        '''
+
+        :param df: Dataframe for segmentation
+        :return:
+        '''
         # Ensure datetime is in the correct format and sorted
         df['datetime'] = pd.to_datetime(df['datetime'])
         df.sort_values('datetime', inplace=True)
