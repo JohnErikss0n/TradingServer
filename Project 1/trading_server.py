@@ -8,14 +8,14 @@ import threading
 import sqlite3
 import asyncio
 import warnings
+from dateutil.relativedelta import relativedelta
 
 from datetime import datetime, timedelta
-
-
+#second key
 
 
 class DatabaseManager:
-    def __init__(self, db_path='stock_prices.db',blank_db = False):
+    def __init__(self, db_path='stock_prices.db', blank_db=False):
         """
         Initializes the database manager with a given database path and option to start with a blank database.
 
@@ -31,7 +31,7 @@ class DatabaseManager:
             self.conn.commit()
 
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS stock_data
-                               (datetime TEXT, ticker TEXT, price REAL, signal INTEGER, pnl REAL)''')
+                               (datetime DATETIME, ticker TEXT, price REAL, signal INTEGER, pnl REAL)''')
         self.conn.commit()
 
     def write_dataframe_to_sqlite(self, df):
@@ -41,14 +41,13 @@ class DatabaseManager:
         Parameters:
         - df (DataFrame): The DataFrame to be written into the 'stock_data' table.
         """
+        df['datetime'] = pd.to_datetime(df['datetime']).dt.strftime('%Y-%m-%d %H:%M:%S')
         df = df[['datetime','ticker','price','signal','pnl']]
         df.to_sql('stock_data', self.conn, if_exists='append', index=False)
 
     def close(self):
         """Closes the database connection."""
-
         self.conn.close()
-
 
 class TradingServer:
     def __init__(self, port, tickers, host,alphavantage_key,finnhub_key, interval='5min',reset_db=False,retrieve_historic=False):
@@ -71,7 +70,7 @@ class TradingServer:
         time.sleep(1)
         for ticker in self.tickers:
             if not self.check_ticker_validity(ticker):
-                self.ickers.remove(ticker)
+                self.tickers.remove(ticker)
         if interval.strip() not in ['1min', '5min', '15min', '30min', '60min']:
             raise ValueError("Interval must be one of: ['1min', '5min', '15min', '30min', '60min']",flush=True)
         self.interval = interval.strip()
@@ -79,9 +78,7 @@ class TradingServer:
 
         #Thread will sleep for 12*number of tickers with missing data for the "data" function
         self.alphavantage_sleep = 0
-
         self.month_offsets = {ticker: 0 for ticker in self.tickers}
-
         self.db = DatabaseManager(blank_db=reset_db)
         self.start_data_fetch_threads()
 
@@ -132,35 +129,27 @@ class TradingServer:
             time.sleep(quote_update_interval)
 
     def fetch_and_update_quote(self, ticker):
-        """
-        Fetches and updates the database with the latest quote for a given ticker.
-
-        Parameters:
-        - ticker (str): The ticker symbol to fetch the quote for.
-        """
         url = f'https://finnhub.io/api/v1/quote?symbol={ticker}&token={self.finnhub}'
         response = requests.get(url)
         if response.status_code == 200:
             data = response.json()
             current_price = data['c']
-
-            query = f"""SELECT * FROM stock_data WHERE ticker = ? AND datetime > ? ORDER BY datetime ASC"""
-            one_day_ago = datetime.now() - timedelta(days=1)
-            self.db.cursor.execute(query, (ticker, one_day_ago.strftime('%Y-%m-%d %H:%M:%S')))
+            # Format the datetime for SQL insertion/querying
+            current_datetime = data['t']
+            query = """SELECT * FROM stock_data WHERE ticker = ? AND datetime > ? ORDER BY datetime ASC"""
+            one_day_ago = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+            self.db.cursor.execute(query, (ticker, one_day_ago))
             rows = self.db.cursor.fetchall()
             if rows:
                 df = pd.DataFrame(rows, columns=['datetime', 'ticker', 'price', 'signal', 'pnl'])
             else:
                 df = pd.DataFrame(columns=['datetime', 'ticker', 'price', 'signal', 'pnl'])
-
-            new_row_df = pd.DataFrame([{'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'ticker': ticker,
-                                        'price': current_price, 'signal': np.nan, 'pnl': np.nan}])
+            new_row_df = pd.DataFrame([{'datetime': current_datetime, 'ticker': ticker, 'price': current_price,
+                                        'signal': np.nan, 'pnl': np.nan}])
             df = pd.concat([df, new_row_df], ignore_index=True)
             df = self.calculate_signal_and_pnl(df)
             df.reset_index(inplace=True)
-            # Update the database
             self.db.write_dataframe_to_sqlite(df.tail(1))  # Only write the LATEST row
-
             return True
         else:
             print(f"Failed to fetch quote for {ticker}")
@@ -246,9 +235,11 @@ class TradingServer:
         df.set_index('datetime', inplace=True)
         df.sort_values('datetime', inplace=True)
 
-        # Calculate moving average and standard deviation over a rolling window
-        df['S_avg'] = df['price'].rolling('24h').mean()
-        df['Sigma'] = df['price'].rolling('24h').std()
+        # Calculate moving average and standard deviation over a rolling window. Window is the number of datapoints in a day.
+        df['S_avg'] = df.groupby(df.index.date)['price'].transform(
+            lambda x: x.rolling(window=len(x), min_periods=1).mean())
+        df['Sigma'] = df.groupby(df.index.date)['price'].transform(
+            lambda x: x.rolling(window=len(x), min_periods=1).std())
 
         df['Pos'] = np.nan
 
@@ -291,7 +282,7 @@ class TradingServer:
             return data
         else:
             print(f"No data found for {ticker} for {target_Y_m}.")
-            return pd.DataFrame()
+            return None
 
     def run_asyncio_server(self):
         '''
@@ -335,11 +326,40 @@ class TradingServer:
             self.db.conn.commit()
             print(f"Deleted all entries for {ticker} and removed from tickers list.")
 
+    def apply_calculations_segmented(self,df):
+        # Ensure datetime is in the correct format and sorted
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df.sort_values('datetime', inplace=True)
+
+        # Find gaps in the data to segment the DataFrame
+        df['date'] = df['datetime'].dt.date
+        df['gap'] = df['date'].diff() > pd.Timedelta(days=1)
+
+        # Identify segments by cumulative sum of gaps
+        df['segment'] = df['gap'].cumsum()
+
+        results = []  # List to hold the result of each segment's calculation
+
+        for segment in df['segment'].unique():
+            segment_df = df[df['segment'] == segment].copy()
+            segment_df.drop(['date', 'gap', 'segment'], axis=1, inplace=True)
+            # Apply your calculation function to each segment
+            calculated_df = self.calculate_signal_and_pnl(segment_df)
+            results.append(calculated_df)
+
+        # Combine all the segments back into a single DataFrame
+        final_df = pd.concat(results).sort_index()
+        return final_df
+
+
     def generate_report(self):
         """
         Generates a CSV report of the data stored in the database.
         """
         df = pd.read_sql_query("SELECT * FROM stock_data", self.db.conn)
+
+        #Ensuring signal computed for as many dates as possible at this point in time.
+        df = self.apply_calculations_segmented(df)
         report_path = "server_report.csv"
         df.to_csv(report_path, index=False)
         print(f"Report generated and saved to {report_path}")
@@ -366,18 +386,15 @@ class TradingServer:
                 await writer.drain()
 
     async def query_data_as_of(self, datetime_str):
-        # Convert the datetime string to a datetime object
         query_datetime = datetime.strptime(datetime_str, "%Y-%m-%d-%H:%M")
-
         response = ""
         tickers_missing = []
         tickers_invalid = []
+
         for ticker in self.tickers:
             data_available, valid, data = self.check_data_availability(query_datetime, ticker)
             if not data_available:
-                # In case it is more recent, try to update the quote
                 self.fetch_and_update_quote(ticker)
-                # Check again after updating
                 data_available, valid, data = self.check_data_availability(query_datetime, ticker)
 
             if not data_available:
@@ -387,58 +404,68 @@ class TradingServer:
             else:
                 response += "\n" + data
 
-        # Handle missing or invalid data by trying to fetch previous month's data
+        # Handle missing or invalid data
         if tickers_missing or tickers_invalid:
             self.alphavantage_sleep = 12 * (len(tickers_missing) + len(tickers_invalid) + 1)
             time.sleep(self.alphavantage_sleep)  # Sleep to respect API call limits
 
-            # Calculate the previous business day, not just the previous day
-            previous_business_day = query_datetime - timedelta(days=1)
-            while previous_business_day.weekday() > 4:  # Mon-Fri are 0-4
-                previous_business_day -= timedelta(days=1)
-
-            # Attempt to update data for missing or invalid tickers
             combined_tickers = set(tickers_missing + tickers_invalid)
             for ticker in combined_tickers:
-                self.initialize_server_data(ticker=ticker, interval=self.interval,
-                                            target_Y_m=previous_business_day.strftime("%Y-%m"))
-                data_available, valid, data = self.check_data_availability(previous_business_day, ticker)
+                # Try the current month first
+                data_available, valid, data = self.check_data_availability(query_datetime, ticker)
+                if not data_available:
+                    self.initialize_server_data(ticker=ticker, interval=self.interval,
+                                                target_Y_m=query_datetime.strftime("%Y-%m"))
+                data_available, valid, data = self.check_data_availability(query_datetime, ticker)
+                if not valid:
+                    # If not valid, calculate and try the previous month
+                    self.initialize_server_data(ticker=ticker, interval=self.interval,
+                                                target_Y_m=((query_datetime - relativedelta(months=1)).strftime("%Y-%m")))
+                    data_available, valid, data = self.check_data_availability(query_datetime, ticker)
+
+                # Update response based on data availability and validity
                 if data_available and valid:
                     response += "\n" + data
                 else:
                     response += f"\nUnable to retrieve data or signal for {ticker}. This may be due to the ticker not existing or the provided date not being supported by the API (e.g., prior to 2000 or in the future)."
 
-        # Format and return the data response
         return response
+
     def check_data_availability(self, query_datetime, ticker):
-        query_datetime_str = query_datetime.strftime('%Y-%m-%d %H:%M')
-        start_datetime = query_datetime - timedelta(minutes=self.interval_int)
-        start_datetime_str = start_datetime.strftime(
-            '%Y-%m-%d %H:%M')  # Most recent interval would be contained in this
+        query_datetime_str = query_datetime.strftime('%Y-%m-%d %H:%M:%S')
 
-        # Find the previous business day
-        prev_business_day =  (pd.bdate_range(end=query_datetime - timedelta(days=1), periods=1)).strftime('%Y-%m-%d %H:%M')[0]
-
+        start_of_yesterday_business = pd.bdate_range(end=query_datetime - timedelta(days=1), periods=1)[0]
+        start_of_yesterday = start_of_yesterday_business.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_yesterday_str = start_of_yesterday.strftime('%Y-%m-%d %H:%M:%S')
         query = """SELECT ticker, price, signal FROM stock_data 
-                   WHERE datetime <= ? and datetime >= ? and ticker= ?  
+                   WHERE datetime <= ? AND datetime >= ? AND ticker = ?  
                    ORDER BY datetime DESC LIMIT 1;"""
-        self.db.cursor.execute(query, (query_datetime_str, start_datetime_str, ticker))
+        self.db.cursor.execute(query, (query_datetime_str, start_of_yesterday_str, ticker))
         result = self.db.cursor.fetchall()
 
-        query_valid = """SELECT ticker, price, signal FROM stock_data 
-                         WHERE datetime <= ? and datetime >= ? and ticker= ? 
-                         and datetime < ? ORDER BY datetime DESC LIMIT 1;"""
-        self.db.cursor.execute(query_valid, (query_datetime_str, start_datetime_str, ticker, prev_business_day))
-        result_valid = self.db.cursor.fetchall()
+
+        # Find the previous business day
+        prev_business_day = (pd.bdate_range(end=query_datetime - timedelta(days=1), periods=1)).strftime('%Y-%m-%d')[0]
+        prev_business_day_str = datetime.strptime(prev_business_day, '%Y-%m-%d').strftime(
+            '%Y-%m-%d')
+
+        # Check if there is any data for the ticker on the previous business day
+        query_prev_day = """SELECT ticker, price, signal FROM stock_data 
+                            WHERE datetime LIKE ? and ticker= ?  
+                            ORDER BY datetime DESC LIMIT 1;"""
+        prev_business_day_str = prev_business_day_str+"%"
+        self.db.cursor.execute(query_prev_day, (prev_business_day_str, ticker))
+        result_prev_day = self.db.cursor.fetchall()
 
         data = ", ".join(
             [f"{row[0]}: Price={row[1]}, Signal={row[2]}" for row in result]) if result else "No data available."
-        # Determine validity based on presence of data for both the query day and the previous business day
+
+        # Determine validity based on the presence of data for the query day
         is_data_available = bool(result)
-        is_prev_day_data_available = bool(result_valid)
+        # Additional validation: check if there's data for the previous business day as well
+        is_prev_day_data_available = bool(result_prev_day)
 
         return is_data_available, is_prev_day_data_available, data
-
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
         Handles client connections,  commands, and responses.
