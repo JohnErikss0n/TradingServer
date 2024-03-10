@@ -5,52 +5,15 @@ import os
 import numpy as np
 import time
 import threading
-import sqlite3
 import asyncio
 import warnings
 from dateutil.relativedelta import relativedelta
-
+from database_manager import DatabaseManager
 from datetime import datetime, timedelta
-#second key
 
-
-class DatabaseManager:
-    def __init__(self, db_path='stock_prices.db', blank_db=False):
-        """
-        Initializes the database manager with a given database path and option to start with a blank database.
-
-        Parameters:
-        - db_path (str): Path to the SQLite database file.
-        - blank_db (bool): If True, clears the existing data in the database. Default is False.
-        """
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        if blank_db and os.path.exists(self.db_path):
-            self.cursor.execute('''DELETE FROM stock_data''')
-            self.conn.commit()
-
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS stock_data
-                               (datetime DATETIME, ticker TEXT, price REAL, signal INTEGER, pnl REAL)''')
-        self.conn.commit()
-
-    def write_dataframe_to_sqlite(self, df):
-        """
-        Writes a given DataFrame to the SQLite database.
-
-        Parameters:
-        - df (DataFrame): The DataFrame to be written into the 'stock_data' table.
-        """
-        df['datetime'] = pd.to_datetime(df['datetime']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        df = df[['datetime','ticker','price','signal','pnl']]
-        df.to_sql('stock_data', self.conn, if_exists='append', index=False)
-
-    def close(self):
-        """Closes the database connection."""
-        self.conn.close()
 
 class TradingServer:
-    def __init__(self, port, tickers, host,alphavantage_key,finnhub_key, interval='5min',reset_db=False,retrieve_historic=False):
+    def __init__(self, port, tickers, host,alphavantage_key,finnhub_key, interval='5min',reset_db=False, retrieve_historic=False):
         """
         Initializes the trading server with specified settings.
 
@@ -68,49 +31,82 @@ class TradingServer:
         self.finnhub = finnhub_key
         self.alphavantage = alphavantage_key
         time.sleep(1)
-        for ticker in self.tickers:
-            if not self.check_ticker_validity(ticker):
-                self.tickers.remove(ticker)
-        if interval.strip() not in ['1min', '5min', '15min', '30min', '60min']:
-            raise ValueError("Interval must be one of: ['1min', '5min', '15min', '30min', '60min']",flush=True)
+        self.db = DatabaseManager(blank_db=reset_db)
         self.interval = interval.strip()
         self.interval_int = int(self.interval.replace("min",""))
+
+        self.startup_handler()
 
         #Thread will sleep for 12*number of tickers with missing data for the "data" function
         self.alphavantage_sleep = 0
         self.month_offsets = {ticker: 0 for ticker in self.tickers}
-        self.db = DatabaseManager(blank_db=reset_db)
         self.start_data_fetch_threads()
+    def startup_handler(self):
+        for ticker in self.tickers:
+            if not self.check_ticker_validity(ticker):
+                self.tickers.remove(ticker)
+
+        if self.interval.strip() not in ['1min', '5min', '15min', '30min', '60min']:
+            raise ValueError("Interval must be one of: ['1min', '5min', '15min', '30min', '60min']", flush=True)
+        query = """SELECT DISTINCT ticker FROM stock_data"""
+        self.db.cursor.execute(query)
+        rows = self.db.cursor.fetchall()
+        for ticker_in_db in rows:
+            if ticker_in_db[0] not in self.tickers:
+                remove_ticker = input(f'{ticker_in_db[0]} not included in startup found in database, would you like to remove it? Y/N: ')
+                if remove_ticker == 'Y':
+                    query = "DELETE FROM stock_data WHERE ticker = ?"
+                    self.db.cursor.execute(query, (ticker_in_db[0],))
+                    self.db.conn.commit()
+                    print(f"Deleted all entries for {ticker_in_db[0]}.")
+                elif remove_ticker == 'N':
+                    print(f"OK, keeping {ticker_in_db[0]} and adding to list of momitored tickers.")
+                    self.tickers.append(ticker_in_db[0])
+                else:
+                    print(f"Unrecognized response {remove_ticker}. Please remove manually using the delete function.")
+                    self.tickers.append(ticker_in_db[0])
 
     def start_data_fetch_threads(self):
         """
         Starts background threads for fetching data and handling server requests.
         """
-        if self.retrieve_historic:
-            self.data_fetch_thread = threading.Thread(target=self.fetch_and_update_data_loop)
-            self.data_fetch_thread.daemon = True
-            self.data_fetch_thread.start()
+
+        self.data_fetch_thread = threading.Thread(target=self.fetch_and_update_data_loop)
+        self.data_fetch_thread.daemon = True
+        self.data_fetch_thread.start()
 
         self.quote_fetch_thread = threading.Thread(target=self.fetch_and_update_quotes_loop)
         self.quote_fetch_thread.daemon = True
         self.quote_fetch_thread.start()
 
-        self.quote_fetch_thread = threading.Thread(target=self.run_asyncio_server)
-        self.quote_fetch_thread.daemon = True
-        self.quote_fetch_thread.start()
+        self.server_thread = threading.Thread(target=self.run_asyncio_server)
+        self.server_thread.daemon = True
+        self.server_thread.start()
 
     def fetch_and_update_data_loop(self):
         """
         Continuously fetches and updates historical data for monitored tickers.
         """
         while True:
+            now = datetime.now()
+
+            # Start of the current month
+            start_of_current_month = datetime(now.year, now.month, 1)
+
+            # Start of the previous month
+            start_of_previous_month = start_of_current_month - relativedelta(months=1)
+
             for ticker in list(self.tickers):
                 try:
-                    target_Y_m = (datetime.now() - timedelta(days=30 * self.month_offsets[ticker])).strftime('%Y-%m')
-                    #API does not support earlier dates
-                    if target_Y_m <datetime.strptime('2000-01-01','%Y-%m-%d'):
+                    # Calculate the target year and month as a datetime object
+                    target_Y_m = (datetime.now() - relativedelta(months=30 * self.month_offsets[ticker]))
+
+                    if target_Y_m < datetime.strptime('2000-01-01', '%Y-%m-%d') or (
+                            target_Y_m < start_of_previous_month):
                         continue
-                    self.initialize_server_data(interval=self.interval, ticker=ticker,target_Y_m= target_Y_m)
+
+                    self.initialize_server_data(interval=self.interval, ticker=ticker,
+                                                target_Y_m=target_Y_m.strftime('%Y-%m'))
                     self.month_offsets[ticker] += 1
                 except Exception as e:
                     print(f"Error fetching data for {ticker}: {e}")
@@ -134,11 +130,15 @@ class TradingServer:
         if response.status_code == 200:
             data = response.json()
             current_price = data['c']
-            # Format the datetime for SQL insertion/querying
-            current_datetime = data['t']
+
+            #datetime presented in unix seconds
+            current_datetime = pd.to_datetime(data['t'], unit='s')
+
+
             query = """SELECT * FROM stock_data WHERE ticker = ? AND datetime > ? ORDER BY datetime ASC"""
-            one_day_ago = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
-            self.db.cursor.execute(query, (ticker, one_day_ago))
+            start_of_yesterday_business = pd.bdate_range(end=current_datetime - timedelta(days=1), periods=1)[0]
+            start_of_yesterday = start_of_yesterday_business.replace(hour=0, minute=0, second=0, microsecond=0)
+            self.db.cursor.execute(query, (ticker, start_of_yesterday.strftime('%Y-%m-%d %H:%M')))
             rows = self.db.cursor.fetchall()
             if rows:
                 df = pd.DataFrame(rows, columns=['datetime', 'ticker', 'price', 'signal', 'pnl'])
@@ -190,15 +190,13 @@ class TradingServer:
                 return f"Error, {ticker} does not exist or is not recognized by the API."
             self.month_offsets[ticker] = 0
             self.tickers.append(ticker)
-
-            #check if valid ticker
             return f"{ticker} successfully added to the server"
         else:
             return f"{ticker} already being monitored by the server"
 
     def initialize_server_data(self, interval, ticker, target_Y_m):
         """
-        Initializes the server data for a given ticker, interval, and target year-month.
+        Initializes and updates the server data for a given ticker, interval, and target year-month.
 
         Parameters:
         - interval (str): The data interval.
@@ -324,8 +322,9 @@ class TradingServer:
             query = "DELETE FROM stock_data WHERE ticker = ?"
             self.db.cursor.execute(query, (ticker,))
             self.db.conn.commit()
-            print(f"Deleted all entries for {ticker} and removed from tickers list.")
-
+            return f"Deleted all entries for {ticker} and removed from tickers list."
+        else:
+            return f"{ticker} not currently monitored by the server."
     def apply_calculations_segmented(self,df):
         '''
 
@@ -354,7 +353,7 @@ class TradingServer:
 
         # Combine all the segments back into a single DataFrame
         final_df = pd.concat(results).sort_index()
-        return final_df
+        return final_df.reset_index()
 
 
     def generate_report(self):
@@ -524,7 +523,7 @@ class TradingServer:
                     elif message == 'report':
                         self.generate_report()
                         await self.stream_report(writer)
-                        continue
+
                     else:
                         response = "Unknown command or message"
 
