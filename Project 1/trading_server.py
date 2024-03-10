@@ -1,14 +1,13 @@
 import argparse
 import pandas as pd
 import requests
-import json
 import os
 import numpy as np
 import time
 import threading
 import sqlite3
 import asyncio
-
+import warnings
 
 from datetime import datetime, timedelta
 
@@ -52,7 +51,7 @@ class DatabaseManager:
 
 
 class TradingServer:
-    def __init__(self, port, tickers, host, interval='5min',reset_db=False,retrieve_historic=False):
+    def __init__(self, port, tickers, host,alphavantage_key,finnhub_key, interval='5min',reset_db=False,retrieve_historic=False):
         """
         Initializes the trading server with specified settings.
 
@@ -65,18 +64,22 @@ class TradingServer:
         """
         self.port = port
         self.host = host
-        self.retrieve_historic=retrieve_historic
+        self.retrieve_historic = retrieve_historic
         self.tickers = tickers.split(',')
+        self.finnhub = finnhub_key
+        self.alphavantage = alphavantage_key
+        time.sleep(1)
+        for ticker in self.tickers:
+            if not self.check_ticker_validity(ticker):
+                self.ickers.remove(ticker)
         if interval.strip() not in ['1min', '5min', '15min', '30min', '60min']:
             raise ValueError("Interval must be one of: ['1min', '5min', '15min', '30min', '60min']",flush=True)
         self.interval = interval.strip()
         self.interval_int = int(self.interval.replace("min",""))
-        self.alphavantage = 1
 
         #Thread will sleep for 12*number of tickers with missing data for the "data" function
         self.alphavantage_sleep = 0
 
-        self.finnhub = 1
         self.month_offsets = {ticker: 0 for ticker in self.tickers}
 
         self.db = DatabaseManager(blank_db=reset_db)
@@ -86,7 +89,7 @@ class TradingServer:
         """
         Starts background threads for fetching data and handling server requests.
         """
-        if self.retreive_historic:
+        if self.retrieve_historic:
             self.data_fetch_thread = threading.Thread(target=self.fetch_and_update_data_loop)
             self.data_fetch_thread.daemon = True
             self.data_fetch_thread.start()
@@ -244,8 +247,8 @@ class TradingServer:
         df.sort_values('datetime', inplace=True)
 
         # Calculate moving average and standard deviation over a rolling window
-        df['S_avg'] = df['price'].rolling('24H').mean()
-        df['Sigma'] = df['price'].rolling('24H').std()
+        df['S_avg'] = df['price'].rolling('24h').mean()
+        df['Sigma'] = df['price'].rolling('24h').std()
 
         df['Pos'] = np.nan
 
@@ -366,77 +369,75 @@ class TradingServer:
         # Convert the datetime string to a datetime object
         query_datetime = datetime.strptime(datetime_str, "%Y-%m-%d-%H:%M")
 
-        # Check if the data is available in the database
         response = ""
-        missing = 0
         tickers_missing = []
+        tickers_invalid = []
         for ticker in self.tickers:
-            data_available, data = self.check_data_availability(query_datetime,ticker)
+            data_available, valid, data = self.check_data_availability(query_datetime, ticker)
             if not data_available:
-                #In case it is more recent
+                # In case it is more recent, try to update the quote
                 self.fetch_and_update_quote(ticker)
-            data_available, data = self.check_data_availability(query_datetime,ticker)
+                # Check again after updating
+                data_available, valid, data = self.check_data_availability(query_datetime, ticker)
 
             if not data_available:
-                missing+=1
                 tickers_missing.append(ticker)
+            elif not valid:
+                tickers_invalid.append(ticker)
             else:
-                response += data
-        if missing!=0:
-            self.alphavantage_sleep = 12*(missing+1)
-            time.sleep(12) #Wait in case there was a query that was initiated immediately when this line was run.
-            for ticker in tickers_missing:
-                self.initialize_server_data(ticker=ticker,interval=self.interval,target_Y_m=query_datetime.strftime("%Y-%m"))
-                data_available, data = self.check_data_availability(query_datetime,ticker)
-                if not data_available:
-                    response+=f"Unable to retreive data or signal for {ticker}"
+                response += "\n" + data
+
+        # Handle missing or invalid data by trying to fetch previous month's data
+        if tickers_missing or tickers_invalid:
+            self.alphavantage_sleep = 12 * (len(tickers_missing) + len(tickers_invalid) + 1)
+            time.sleep(self.alphavantage_sleep)  # Sleep to respect API call limits
+
+            # Calculate the previous business day, not just the previous day
+            previous_business_day = query_datetime - timedelta(days=1)
+            while previous_business_day.weekday() > 4:  # Mon-Fri are 0-4
+                previous_business_day -= timedelta(days=1)
+
+            # Attempt to update data for missing or invalid tickers
+            combined_tickers = set(tickers_missing + tickers_invalid)
+            for ticker in combined_tickers:
+                self.initialize_server_data(ticker=ticker, interval=self.interval,
+                                            target_Y_m=previous_business_day.strftime("%Y-%m"))
+                data_available, valid, data = self.check_data_availability(previous_business_day, ticker)
+                if data_available and valid:
+                    response += "\n" + data
                 else:
-                    response += data
+                    response += f"\nUnable to retrieve data or signal for {ticker}. This may be due to the ticker not existing or the provided date not being supported by the API (e.g., prior to 2000 or in the future)."
+
         # Format and return the data response
-        return data
-
-    def check_data_availability(self, query_datetime,ticker):
-        query_datetime_str = query_datetime.strftime('%Y-%m-%d %H:%M:%S')
+        return response
+    def check_data_availability(self, query_datetime, ticker):
+        query_datetime_str = query_datetime.strftime('%Y-%m-%d %H:%M')
         start_datetime = query_datetime - timedelta(minutes=self.interval_int)
-        start_datetime_str = start_datetime.strftime('%Y-%m-%d %H:%M:%S') # Most recent interval would be contained in this
+        start_datetime_str = start_datetime.strftime(
+            '%Y-%m-%d %H:%M')  # Most recent interval would be contained in this
 
-        query = "SELECT ticker, price, signal FROM stock_data WHERE datetime <= ? and datetime >= ? and datetime and ticker= ? ORDER BY datetime DESC LIMIT 1;"
-        self.db.cursor.execute(query, (query_datetime_str,start_datetime_str,ticker))  # Use self.db.cursor
-        result = self.db.cursor.fetchall()  # Use self.db.cursor
+        # Find the previous business day
+        prev_business_day =  (pd.bdate_range(end=query_datetime - timedelta(days=1), periods=1)).strftime('%Y-%m-%d %H:%M')[0]
 
-        if result:
-            data = f"Data available for {query_datetime_str}: " + ", ".join(
-                [f"{row[0]}: Price={row[1]}, Signal={row[2]}" for row in result])
-            return True, data
-        else:
-            return False, "No data available."
+        query = """SELECT ticker, price, signal FROM stock_data 
+                   WHERE datetime <= ? and datetime >= ? and ticker= ?  
+                   ORDER BY datetime DESC LIMIT 1;"""
+        self.db.cursor.execute(query, (query_datetime_str, start_datetime_str, ticker))
+        result = self.db.cursor.fetchall()
 
-    def calculate_missing_data_points(self, query_datetime):
-        fixed_interval_minutes = 5  # Assuming 5-minute intervals for simplicity
-        self.db.cursor.execute("SELECT datetime FROM stock_data ORDER BY datetime DESC LIMIT 1;")  # Use self.db.cursor
-        last_data_point = self.db.cursor.fetchone()  # Use self.db.cursor
+        query_valid = """SELECT ticker, price, signal FROM stock_data 
+                         WHERE datetime <= ? and datetime >= ? and ticker= ? 
+                         and datetime < ? ORDER BY datetime DESC LIMIT 1;"""
+        self.db.cursor.execute(query_valid, (query_datetime_str, start_datetime_str, ticker, prev_business_day))
+        result_valid = self.db.cursor.fetchall()
 
-        if last_data_point:
-            last_data_datetime = datetime.strptime(last_data_point[0], '%Y-%m-%d %H:%M:%S')
-            delta = query_datetime - last_data_datetime
-            missing_intervals = delta.total_seconds() / (fixed_interval_minutes * 60)
-            return int(missing_intervals)
-        else:
-            return 0
+        data = ", ".join(
+            [f"{row[0]}: Price={row[1]}, Signal={row[2]}" for row in result]) if result else "No data available."
+        # Determine validity based on presence of data for both the query day and the previous business day
+        is_data_available = bool(result)
+        is_prev_day_data_available = bool(result_valid)
 
-    def fetch_and_update_data_as_of(self, query_datetime):
-        try:
-            for ticker in self.tickers:
-                print(ticker)
-                url = f'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={ticker.strip()}&interval={self.interval}&{"&month="+query_datetime.strftime("%Y-%m") if query_datetime!= None else ""}&outputsize=full&apikey={self.alphavantage}'
-                response = requests.get(url)
-                data = response.json()
-        except Exception as e:
-            print(f"Failed to fetch data for {ticker} as of {query_datetime}: {str(e)}")
-
-        # After fetching, you might need to adjust `alphavantage_sleep` back or perform other cleanup actions
-        self.alphavantage_sleep = max(0, self.alphavantage_sleep - 12)  # Example adjustment
-
+        return is_data_available, is_prev_day_data_available, data
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
@@ -458,23 +459,34 @@ class TradingServer:
 
                     message = data.decode().strip()
                     print(f"Received: {message}")
-
+                    response = ""
                     if message.lower() == 'quit':
                         response = "Closing connection to: Trading Server"
                         writer.write(response.encode())
                         await writer.drain()
                         break
                     elif message.startswith('add '):
-                        ticker = message.split(' ')[1]
+                        ticker = message.split(' ')[1].upper()
                         response = self.add_ticker(ticker)
                     elif message.startswith('data '):
                         datetime_str = message[5:]
-                        response = await self.query_data_as_of(datetime_str)
-                        writer.write(response.encode() + b'\n')
-                        await writer.drain()
+                        input_datetime = datetime.strptime(datetime_str, "%Y-%m-%d-%H:%M")
+                        # Threshold of available data
+                        threshold_datetime = datetime.strptime("2000-01-02", "%Y-%m-%d")
+                        # Get the current datetime
+                        current_datetime = datetime.now()
+                        if input_datetime > current_datetime:
+                            response  = f"The input datetime {input_datetime} is in the future."
+                        elif input_datetime < threshold_datetime:
+                            response = f"The input datetime {input_datetime} is prior to 2000-01-02, the limit of data we can use (need at least one day to calculate data on)."
+                        else:
+                            response = await self.query_data_as_of(datetime_str)
+
+                        #writer.write(response.encode() + b'\n')
+                        #await writer.drain()
 
                     elif message.startswith('delete '):
-                        ticker = message.split(' ')[1]
+                        ticker = message.split(' ')[1].upper()
                         self.delete_ticker(ticker)
                         response = f"Deleted ticker: {ticker}"
                     elif message == 'report':
@@ -484,7 +496,7 @@ class TradingServer:
                     else:
                         response = "Unknown command or message"
 
-                    writer.write(response.encode())
+                    writer.write(response.encode('utf-8'))
                     await writer.drain()
                     print("Sent response",flush=True)
                 except Exception as e:
@@ -500,24 +512,28 @@ class TradingServer:
             print("Connection closed.",flush=True)
         except Exception as e:
             print(f"An error occurred: {e}",flush=True)
-            writer.close()
-            await writer.wait_closed()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trading Server")
+    parser.add_argument("--finnhub_key", type=str, help="API Key for Finnhub")
+    parser.add_argument("--alphavantage_key", type=str, help="API Key for AlphaVantage")
+
     parser.add_argument("--tickers", type=str, help="List of tickers, as strings in the form: ticker1,ticker2,ticker3...")
     parser.add_argument("--port", type=int, default=8000, help="Network port for the server")
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to listen on')
-    parser.add_argument('--reset_db', type=bool, default=False, help='Delete existing database on startup')
+    parser.add_argument('--reset_db', type=bool, default=False, help='Including this argument deletes existing database on startup')
     parser.add_argument('--retrieve_historic', type=bool, default=False, help='Continuously retrieve historic data from alphavantage (not recommended given API limitations).')
     parser.add_argument('--interval', type=str, default='5min', help='Interval we want to obtain our historic data at. \
                                                                     Can be one of: 1min, 5min, 15min, 30min, 60min.')
 
     args = parser.parse_args()
-    trading_Server = TradingServer(port=args.port,tickers=args.tickers,host=args.host,interval='5min',reset_db=args.reset_db)
+    # Suppress future warnings, since environment hardcoded.
+    warnings.filterwarnings('ignore', category=FutureWarning)
+
+    trading_Server = TradingServer(alphavantage_key=args.alphavantage_key,finnhub_key=args.finnhub_key,port=args.port,tickers=args.tickers,host=args.host,interval='5min',reset_db=args.reset_db)
     try:
         while True:
-            time.sleep(1)  # Keep the main thread alive with minimal CPU usage.
+            time.sleep(1)  # Keep the main thread alive.
     except KeyboardInterrupt:
         print("Exiting the trading server...")

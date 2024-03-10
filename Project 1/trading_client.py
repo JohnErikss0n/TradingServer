@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import os
 
 async def send_command_to_server(reader, writer, command):
     print(f"Sending: {command}")
@@ -22,7 +21,7 @@ async def send_command_to_server(reader, writer, command):
 
     else:
         response = await reader.read(4096)
-        print(f"Received: {response.decode()}")
+        print(f"\nReceived: \n{response.decode('utf-8')}\n")
 
 
 async def client_loop(server_ip, server_port):
