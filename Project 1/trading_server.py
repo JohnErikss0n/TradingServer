@@ -1,15 +1,19 @@
 import argparse
+import asyncio
+import os
+import threading
+import time
+import warnings
+from datetime import datetime, timedelta
+from threading import Semaphore
+
+import aiofiles
+import numpy as np
 import pandas as pd
 import requests
-import os
-import numpy as np
-import time
-import threading
-import asyncio
-import warnings
 from dateutil.relativedelta import relativedelta
+
 from database_manager import DatabaseManager
-from datetime import datetime, timedelta
 
 
 class TradingServer:
@@ -40,6 +44,8 @@ class TradingServer:
         #Thread will sleep for 12*number of tickers with missing data for the "data" function
         self.alphavantage_sleep = 0
         self.month_offsets = {ticker: 0 for ticker in self.tickers}
+        self.db_access_semaphore = Semaphore()  # Controls access to the database
+        self.tickers_access_semaphore = Semaphore()  # Controls access to the tickers list
         self.start_data_fetch_threads()
     def startup_handler(self):
         for ticker in self.tickers:
@@ -89,28 +95,24 @@ class TradingServer:
         """
         while True:
             now = datetime.now()
-
-            # Start of the current month
-            start_of_current_month = datetime(now.year, now.month, 1)
-
-            # Start of the previous month
-            start_of_previous_month = start_of_current_month - relativedelta(months=1)
-
             for ticker in list(self.tickers):
                 try:
-                    # Calculate the target year and month as a datetime object
-                    target_Y_m = (datetime.now() - relativedelta(months=30 * self.month_offsets[ticker]))
+                    # Calculate target_Y_m as the current time minus the offset for this ticker
+                    target_Y_m = now - relativedelta(months=self.month_offsets[ticker])
+                    print(f"Fetching data for {ticker} for month: {target_Y_m.strftime('%Y-%m')}", flush=True)
 
-                    if target_Y_m < datetime.strptime('2000-01-01', '%Y-%m-%d') or (
-                            target_Y_m < start_of_previous_month):
-                        continue
-
-                    self.initialize_server_data(interval=self.interval, ticker=ticker,
-                                                target_Y_m=target_Y_m.strftime('%Y-%m'))
+                    if not self.db.is_data_available_for_month(target_Y_m, ticker):
+                        # If data for this month isn't available, fetch and update
+                        self.initialize_server_data(interval=self.interval, ticker=ticker,
+                                                    target_Y_m=target_Y_m.strftime('%Y-%m'))
+                    else:
+                        print(f"Data for {ticker} for month {target_Y_m.strftime('%Y-%m')} already exists.")
                     self.month_offsets[ticker] += 1
-                except Exception as e:
-                    print(f"Error fetching data for {ticker}: {e}")
 
+                except Exception as e:
+                    print(f"Error fetching data for {ticker}: {e}",flush=True )
+
+                #respect API limits.
                 time.sleep(12)
 
     def fetch_and_update_quotes_loop(self):
@@ -149,8 +151,12 @@ class TradingServer:
             df = pd.concat([df, new_row_df], ignore_index=True)
             df = self.calculate_signal_and_pnl(df)
             df.reset_index(inplace=True)
-            self.db.write_dataframe_to_sqlite(df.tail(1))  # Only write the LATEST row
-            return True
+            self.db_access_semaphore.acquire()
+            try:
+                self.db.write_dataframe_to_sqlite(df.tail(1))  # Only write the LATEST row
+            finally:
+                self.db_access_semaphore.release()
+                return True
         else:
             print(f"Failed to fetch quote for {ticker}")
             return False
@@ -184,15 +190,21 @@ class TradingServer:
         Returns:
         - str: A message indicating the result of the operation.
         """
-        if ticker not in self.tickers:
-            ticker_exists = self.check_ticker_validity(ticker)
-            if not ticker_exists:
-                return f"Error, {ticker} does not exist or is not recognized by the API."
-            self.month_offsets[ticker] = 0
-            self.tickers.append(ticker)
-            return f"{ticker} successfully added to the server"
-        else:
-            return f"{ticker} already being monitored by the server"
+        self.tickers_access_semaphore.acquire()
+
+        try:
+            if ticker not in self.tickers:
+                ticker_exists = self.check_ticker_validity(ticker)
+                if not ticker_exists:
+                    return f"Error, {ticker} does not exist or is not recognized by the API."
+                self.month_offsets[ticker] = 0
+                self.tickers.append(ticker)
+                result = f"{ticker} successfully added to the server"
+            else:
+                result = f"{ticker} already being monitored by the server"
+        finally:
+            self.tickers_access_semaphore.release()
+        return result
 
     def initialize_server_data(self, interval, ticker, target_Y_m):
         """
@@ -217,7 +229,11 @@ class TradingServer:
 
         df = self.calculate_signal_and_pnl(df)
         df.reset_index(inplace=True)
-        self.db.write_dataframe_to_sqlite(df)
+        self.db_access_semaphore.acquire()
+        try:
+            self.db.write_dataframe_to_sqlite(df)
+        finally:
+            self.db_access_semaphore.release()
 
     def calculate_signal_and_pnl(self,df):
         """
@@ -252,6 +268,8 @@ class TradingServer:
         df['pnl'] = df['Pos'].shift(1) * (df['price'] - df['price'].shift(1))
 
         df['pnl'].fillna(0, inplace=True)
+        if "signal" in df.columns:
+            df = df.drop(['signal'],axis=1)
         df = df.rename(columns={"Pos":"signal"})
         return df
 
@@ -311,57 +329,60 @@ class TradingServer:
             await server.serve_forever()
 
     def delete_ticker(self, ticker):
-        """
-        Deletes a ticker from the monitoring list and its data from the database.
+        self.tickers_access_semaphore.acquire()
+        try:
+            if ticker in self.tickers:
+                self.tickers.remove(ticker)
+                self.db_access_semaphore.acquire()
+                try:
+                    query = "DELETE FROM stock_data WHERE ticker = ?"
+                    self.db.cursor.execute(query, (ticker,))
+                    self.db.conn.commit()
+                    result = f"Deleted all entries for {ticker} and removed from tickers list."
+                finally:
+                    self.db_access_semaphore.release()
+            else:
+                result = f"{ticker} not currently monitored by the server."
+        finally:
+            self.tickers_access_semaphore.release()
+        return result
 
-        Parameters:
-        - ticker (str): The ticker symbol to delete.
-        """
-        if ticker in self.tickers:
-            self.tickers.remove(ticker)
-            query = "DELETE FROM stock_data WHERE ticker = ?"
-            self.db.cursor.execute(query, (ticker,))
-            self.db.conn.commit()
-            return f"Deleted all entries for {ticker} and removed from tickers list."
-        else:
-            return f"{ticker} not currently monitored by the server."
-    def apply_calculations_segmented(self,df):
-        '''
-
-        :param df: Dataframe for segmentation
-        :return:
-        '''
-        # Ensure datetime is in the correct format and sorted
+    def apply_calculations_segmented(self, df):
+        # Ensure datetime is in the correct format and sorted globally
         df['datetime'] = pd.to_datetime(df['datetime'])
-        df.sort_values('datetime', inplace=True)
+        df.sort_values(['ticker', 'datetime'], inplace=True)
+        df['date'] = df['datetime'].dt.floor('D')
 
-        # Find gaps in the data to segment the DataFrame
-        df['date'] = df['datetime'].dt.date
-        df['gap'] = df['date'].diff() > pd.Timedelta(days=1)
+        results = []
 
-        # Identify segments by cumulative sum of gaps
-        df['segment'] = df['gap'].cumsum()
+        for ticker in df['ticker'].unique():
+            ticker_df = df[df['ticker'] == ticker].copy()
+            dates = ticker_df['date'].dt.date
+            gaps = [0] + [np.busday_count(dates.iloc[i - 1], dates.iloc[i]) - 1 for i in range(1, len(dates))]
 
-        results = []  # List to hold the result of each segment's calculation
+            #  True, gaps that are greater than 0
+            ticker_df['gap'] = np.array(gaps) > 0
+            ticker_df['segment'] = ticker_df['gap'].cumsum()
 
-        for segment in df['segment'].unique():
-            segment_df = df[df['segment'] == segment].copy()
-            segment_df.drop(['date', 'gap', 'segment'], axis=1, inplace=True)
-            # Apply your calculation function to each segment
-            calculated_df = self.calculate_signal_and_pnl(segment_df)
-            results.append(calculated_df)
+            for segment in ticker_df['segment'].unique():
+                segment_df = ticker_df[ticker_df['segment'] == segment].copy()
+                segment_df.drop(['date', 'gap', 'segment'], axis=1, inplace=True)
+                calculated_df = self.calculate_signal_and_pnl(segment_df)
+                results.append(calculated_df)
 
-        # Combine all the segments back into a single DataFrame
+        # Combine segments
         final_df = pd.concat(results).sort_index()
         return final_df.reset_index()
-
 
     def generate_report(self):
         """
         Generates a CSV report of the data stored in the database.
         """
-        df = pd.read_sql_query("SELECT * FROM stock_data", self.db.conn)
-
+        self.db_access_semaphore.acquire()
+        try:
+            df = pd.read_sql_query("SELECT * FROM stock_data", self.db.conn)
+        finally:
+            self.db_access_semaphore.release()
         #Ensuring signal computed for as many dates as possible at this point in time.
         df = self.apply_calculations_segmented(df)
         report_path = "server_report.csv"
@@ -369,25 +390,34 @@ class TradingServer:
         print(f"Report generated and saved to {report_path}")
 
     async def stream_report(self, writer):
-        """"
-        Streams the generated report to a client.
+        """
+        Streams the report CSV file to the client.
 
         Parameters:
-        - writer (StreamWriter): The StreamWriter object to write data to the client.
+        - writer: The StreamWriter object to write data to the client.
         """
-
         report_path = "server_report.csv"
+        if not os.path.exists(report_path):
+            print("Report file not found. Generating a new report.")
+            self.generate_report()
+
         # Calculate and send file size first
         file_size = os.path.getsize(report_path)
-        header = f"Content-Length: {file_size}\n"
+        header = f"Content-Length: {file_size}\n\n"
         writer.write(header.encode())
         await writer.drain()
 
-        # Now send the file content
-        with open(report_path, "rb") as file:
-            while chunk := file.read(4096):  # chunks of 4 KB
+        async with aiofiles.open(report_path, "rb") as file:
+            while True:
+                chunk = await file.read(4096)  # Read chunks of 4 KB
+                if not chunk:
+                    break
                 writer.write(chunk)
                 await writer.drain()
+
+
+
+        print("Report sent to the client.")
 
     async def query_data_as_of(self, datetime_str):
         query_datetime = datetime.strptime(datetime_str, "%Y-%m-%d-%H:%M")
@@ -518,8 +548,7 @@ class TradingServer:
 
                     elif message.startswith('delete '):
                         ticker = message.split(' ')[1].upper()
-                        self.delete_ticker(ticker)
-                        response = f"Deleted ticker: {ticker}"
+                        response = self.delete_ticker(ticker)
                     elif message == 'report':
                         self.generate_report()
                         await self.stream_report(writer)
@@ -529,12 +558,12 @@ class TradingServer:
 
                     writer.write(response.encode('utf-8'))
                     await writer.drain()
-                    print("Sent response",flush=True)
+                    print(f"Sent response,{response}",flush=True)
                 except Exception as e:
-                    response = "There was an error with your input: \n"+str(e)
+                    response = "There was an error with your input:"+str(e)
                     writer.write(response.encode())
                     await writer.drain()
-                    print("Sent response", flush=True)
+                    print(f"Sent response,{response }", flush=True)
 
 
             print("Closing the connection",flush=True)
@@ -552,7 +581,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--tickers", type=str, help="List of tickers, as strings in the form: ticker1,ticker2,ticker3...")
     parser.add_argument("--port", type=int, default=8000, help="Network port for the server")
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to listen on')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to listen on, currently all interfaces.')
     parser.add_argument('--reset_db', type=bool, default=False, help='Including this argument deletes existing database on startup')
     parser.add_argument('--retrieve_historic', type=bool, default=False, help='Continuously retrieve historic data from alphavantage (not recommended given API limitations).')
     parser.add_argument('--interval', type=str, default='5min', help='Interval we want to obtain our historic data at. \
@@ -560,7 +589,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     # Suppress future warnings, since environment hardcoded.
-    warnings.filterwarnings('ignore', category=FutureWarning)
+    warnings.filterwarnings('ignore')
 
     trading_Server = TradingServer(alphavantage_key=args.alphavantage_key,finnhub_key=args.finnhub_key,port=args.port,tickers=args.tickers,host=args.host,interval='5min',reset_db=args.reset_db)
     try:
