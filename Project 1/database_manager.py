@@ -1,7 +1,7 @@
-import numpy as np
 import pandas as pd
 import sqlite3
 import os
+from dateutil.relativedelta import relativedelta
 
 class DatabaseManager:
     def __init__(self, db_path='stock_prices.db', blank_db=False):
@@ -33,6 +33,20 @@ class DatabaseManager:
         df['datetime'] = pd.to_datetime(df['datetime'])
         df = df[['datetime','ticker','price','signal','pnl']].dropna()
         df.to_sql('stock_data', self.conn, if_exists='append', index=False)
+
+    def is_data_available_for_month(self, query_datetime, ticker):
+        """
+        Checks if there's data for the specific month and ticker.
+        """
+        start_of_month = query_datetime.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_of_month = (start_of_month + relativedelta(months=1)).strftime('%Y-%m-%d %H:%M:%S')
+        start_of_month = start_of_month.strftime('%Y-%m-%d %H:%M:%S')
+        query = '''SELECT COUNT(*) FROM stock_data
+                   WHERE ticker = ? AND datetime >= ? AND datetime < ?;'''
+
+        self.cursor.execute(query, (ticker, start_of_month, end_of_month))
+        result = self.cursor.fetchone()
+        return result[0] > 0
 
     def close(self):
         """Closes the database connection."""
