@@ -26,7 +26,7 @@ Activate the environment using:
 Below is a sample command line input for the server:
 
 `
-python trading_server.py --tickers "AAPL,MSFT,GOOGL" --port 8000 --host '0.0.0.0' --reset_db False --retrieve_historic False --interval '5min'
+python trading_server.py --tickers "AAPL,MSFT,GOOGL" --port 8000 --host 0.0.0.0 --reset_db False --interval '5min'
 `
 
 Below is a sample command line input for the client:
