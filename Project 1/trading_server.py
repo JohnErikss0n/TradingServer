@@ -463,6 +463,8 @@ class TradingServer:
                 else:
                     response += f"\nUnable to retrieve data or signal for {ticker}. This may be due to the ticker not existing or the provided date not being supported by the API (e.g., prior to 2000 or in the future)."
 
+        if response == "":
+            response = "Not currently monitoring any tickers to provide data on."
         return response
 
     def check_data_availability(self, query_datetime, ticker):
