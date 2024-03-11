@@ -4,6 +4,8 @@
 
 This program initializes a trading server designed to monitor stock tickers, fetch real-time and historical data, and calculate trading signals and profit/loss based on price movements. It leverages data from Alphavantage and Finnhub APIs.
 
+### Note: the alphavantage API is now limited to 25 calls per day. The server will start crawling backwards to build a time series of monthly data every 12 seconds (i.e. the server will attempt to make one call to the API every 12 seconds).  
+
 ## Features
 
 - Fetch and update real-time quotes for specified tickers.
